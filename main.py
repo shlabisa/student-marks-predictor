@@ -8,67 +8,71 @@ from torch.utils.data import Dataset, DataLoader, random_split
 import os
 import matplotlib.pyplot as plt
 import random
+import time
+
+# ANSI escape codes for highlighting
+GREEN = '\033[92m'
+ENDC = '\033[0m'
 
 # Set seed
 torch.manual_seed(42)
 np.random.seed(42)
 
-# ---------- 1. Load and Normalize Dataset ----------
-class ExamDataset(Dataset):
-    def __init__(self, dataframe, normalize=True):
-        features = ['test1', 'test2', 'test3', 'assignment1', 'assignment2', 'project']
-        target = 'exam'
+# Define sequence names
+SEQUENCE_MARKS = ['test1', 'test2', 'test3', 'assignment1', 'assignment2', 'project', 'exam']
+ASSESSMENT_MARKS = SEQUENCE_MARKS[:-1] # test1...project (length 6)
+EXAM_MARK = SEQUENCE_MARKS[-1]         # exam
+MAX_SEQ_LEN = len(ASSESSMENT_MARKS)    # 6
 
-        self.normalize = normalize
-        self.feature_names = features
+# ---------- 1. Load and Normalize Dataset (Revised for Single Target) ----------
+class MarkSequenceDataset(Dataset):
+    def __init__(self, dataframe):
+        # Input sequence: Assessments (6 marks)
+        X = dataframe[ASSESSMENT_MARKS].values.astype(np.float32)
+        # Target: Exam mark (1 mark)
+        y = dataframe[EXAM_MARK].values.astype(np.float32).reshape(-1, 1)
 
-        X = dataframe[features].values.astype(np.float32)
-        y = dataframe[target].values.astype(np.float32).reshape(-1, 1)
-
-        self.X = torch.tensor(X, dtype=torch.float32) / 100
-        """
-        if normalize:
-            self.X_mean = X.mean(axis=0)
-            self.X_std = X.std(axis=0) + 1e-8  # avoid division by 0
-            self.X = torch.tensor((X - self.X_mean) / self.X_std, dtype=torch.float32)
-
-            # Save normalization stats to JSON
-            norm_stats = {
-                'mean': self.X_mean.tolist(),
-                'std': self.X_std.tolist()
-            }
-            os.makedirs('data', exist_ok=True)
-            with open('data/normalization.json', 'w') as f:
-                json.dump(norm_stats, f)
-        else:
-            self.X = torch.tensor(X, dtype=torch.float32)
-        """
-
-        self.y = torch.tensor(y / 100.0, dtype=torch.float32)  # normalize exam marks to [0,1]
+        # Normalize all marks by 100
+        self.X = torch.tensor(X / 100.0, dtype=torch.float32).unsqueeze(-1) # Shape (N, 6, 1)
+        self.y = torch.tensor(y / 100.0, dtype=torch.float32)               # Shape (N, 1)
+        
+        # All sequence lengths are fixed at 6
+        self.L = torch.full((len(self.X),), MAX_SEQ_LEN, dtype=torch.long) # Shape (N,)
 
     def __len__(self):
         return len(self.X)
 
     def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+        # Return X: (6, 1), y: (1,), L: scalar (6)
+        return self.X[idx], self.y[idx], self.L[idx]
 
-# ---------- 2. Model ----------
-class ExamPredictor(nn.Module):
-    def __init__(self, input_size=6):
-        super(ExamPredictor, self).__init__()
-        self.model = nn.Sequential(
-            nn.Linear(input_size, 32),
-            nn.ReLU(),
-            nn.Linear(32, 16),
-            nn.ReLU(),
-            nn.Linear(16, 1),
-            nn.Sigmoid()  # output in [0, 1]
+# ---------- 2. Model (Unchanged) ----------
+class MarkPredictorLSTM(nn.Module):
+    def __init__(self, input_size=1, hidden_size=64, num_layers=2, output_size=1):
+        super(MarkPredictorLSTM, self).__init__()
+        
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x, seq_lengths):
+        x_packed = nn.utils.rnn.pack_padded_sequence(
+            x, seq_lengths.cpu(), batch_first=True, enforce_sorted=False
         )
+        
+        lstm_out_packed, (h_n, c_n) = self.lstm(x_packed)
+        
+        last_hidden_state = h_n[-1] # Output of the last layer
+        
+        output = self.fc(last_hidden_state)
+        output = self.sigmoid(output)
+        
+        return output
 
-    def forward(self, x):
-        return self.model(x)
-
-# ---------- 3. Train ----------
+# ---------- 3. Train (Unchanged) ----------
 def train_model(model, train_loader, val_loader, epochs=100, lr=0.001):
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -79,9 +83,9 @@ def train_model(model, train_loader, val_loader, epochs=100, lr=0.001):
     for epoch in range(epochs):
         model.train()
         train_loss = 0
-        for X_batch, y_batch in train_loader:
+        for X_batch, y_batch, L_batch in train_loader:
             optimizer.zero_grad()
-            outputs = model(X_batch)
+            outputs = model(X_batch, L_batch)
             loss = criterion(outputs, y_batch)
             loss.backward()
             optimizer.step()
@@ -94,8 +98,8 @@ def train_model(model, train_loader, val_loader, epochs=100, lr=0.001):
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for X_val, y_val in val_loader:
-                pred = model(X_val)
+            for X_val, y_val, L_val in val_loader:
+                pred = model(X_val, L_val)
                 val_loss += criterion(pred, y_val).item()
         val_loss /= len(val_loader)
         val_losses.append(val_loss)
@@ -106,65 +110,126 @@ def train_model(model, train_loader, val_loader, epochs=100, lr=0.001):
 
     return train_losses, val_losses
 
-# ---------- 4. Save / Load ----------
-def save_model(model, path='exam_model.pth'):
+# ---------- 4. Save / Load (Unchanged) ----------
+def save_model(model, path='lstm_mark_predictor_final.pth'):
     torch.save(model.state_dict(), path)
     print(f"✅ Model saved to {path}")
 
-def load_model(path='exam_model.pth', input_size=6):
-    model = ExamPredictor(input_size)
+def load_model(path='lstm_mark_predictor_final.pth'):
+    model = MarkPredictorLSTM()
     model.load_state_dict(torch.load(path))
     model.eval()
     print(f"📦 Model loaded from {path}")
     return model
 
-# ---------- 5. Denormalize ----------
+# ---------- 5. Denormalize (Unchanged) ----------
 def denormalize(pred_tensor):
-    """
-    Converts a normalized prediction back to percentage (0-100 scale).
-    """
     return pred_tensor.item() * 100
 
-# ---------- 6. Predict ----------
-def predict(input_tensor, model):
+# ---------- 6. Predict (Updated for Fixed Sequence Input) ----------
+def predict(input_sequence, model):
     """
-    Predicts the exam mark for a given normalized input tensor using a model instance.
-    Input shape: (1, 6)
-    Output: Float in [0, 100]
+    Predicts the next mark for a given sequence of 6 unnormalized marks.
+    Input_sequence is a 1D tensor of *unnormalized* marks of length 6.
     """
+    
+    if len(input_sequence) != MAX_SEQ_LEN:
+        raise ValueError(f"Input sequence must have exactly {MAX_SEQ_LEN} elements (assessments).")
+        
+    # 1. Normalize and structure the input
+    normalized_seq = input_sequence / 100.0
+    seq_len = MAX_SEQ_LEN
+    
+    # 2. Convert to tensor with required shape: (1, MAX_SEQ_LEN, 1)
+    X = normalized_seq.unsqueeze(0).unsqueeze(-1)
+    
+    # 3. Sequence length tensor: (1,)
+    L = torch.tensor([seq_len], dtype=torch.long)
+    
+    # 4. Prediction and time measurement for FPS
+    start_time = time.time()
     with torch.no_grad():
-        output = model(input_tensor)
-    return denormalize(output)
+        output = model(X, L)
+    end_time = time.time()
+    
+    # 5. Denormalize and return with inference time
+    return denormalize(output), (end_time - start_time)
 
-# ---------- 7. Evaluate ----------
+# ---------- 7. Evaluate (Revised for Accuracy and FPS) ----------
+def calculate_accuracy(preds_denorm, y_true_denorm, tolerance=5.0):
+    """
+    Calculates accuracy: percentage of predictions within a tolerance range of the true mark.
+    """
+    correct = torch.sum(torch.abs(preds_denorm - y_true_denorm) <= tolerance).item()
+    total = len(y_true_denorm)
+    accuracy = correct / total
+    return accuracy
+
 def evaluate_model(test_loader, model):
     criterion = nn.MSELoss()
     total_loss = 0
+    total_samples = 0
+    all_preds_denorm = []
+    all_y_true_denorm = []
+    total_inference_time = 0
 
     with torch.no_grad():
-        for X_batch, y_batch in test_loader:
-            preds = model(X_batch)
+        for X_batch, y_batch, L_batch in test_loader:
+            start_time = time.time()
+            preds = model(X_batch, L_batch)
+            end_time = time.time()
+            
+            total_inference_time += (end_time - start_time)
+            
             loss = criterion(preds, y_batch)
-            total_loss += loss.item()
+            total_loss += loss.item() * X_batch.size(0)
+            total_samples += X_batch.size(0)
+            
+            all_preds_denorm.append(preds * 100)
+            all_y_true_denorm.append(y_batch * 100)
 
-    avg_loss = total_loss / len(test_loader)
+    avg_loss = total_loss / total_samples
+    
+    all_preds_denorm = torch.cat(all_preds_denorm)
+    all_y_true_denorm = torch.cat(all_y_true_denorm)
+    
+    accuracy = calculate_accuracy(all_preds_denorm, all_y_true_denorm, tolerance=5.0)
+    
+    if total_inference_time > 0:
+        fps = total_samples / total_inference_time
+    else:
+        fps = float('inf')
+
     print(f"🧪 Test Set MSE Loss: {avg_loss:.4f}")
+    print(f"🎯 Test Set Accuracy (±5 marks): {accuracy:.2f}")
+    print(f"⚡ Inference Performance (FPS): {fps:.2f}")
 
-# ---------- 8. Visualize Prediction ----------
-def visualize_prediction(X, model, Y_true=None):
-    X = X.unsqueeze(0)  # shape (1, 6)
+# ---------- 8. Visualize Prediction (Enhanced with Highlight) ----------
+def visualize_prediction(input_data_unnormalized, model, Y_true=None):
+    
+    try:
+        Y_pred, inference_time = predict(input_data_unnormalized, model)
+    except ValueError as e:
+        print(f"\n🛑 Error for Visualization: {e}")
+        return
 
-    Y_pred = predict(X, model)
+    # Use ANSI code for green highlighting
+    predicted_text = f"{GREEN}{Y_pred:.2f}{ENDC}"
 
     print("\n🔍 Test Sample Evaluation:")
-    print(f"Input (normalized): {X.squeeze(0)}")
-    print(f"Predicted Exam Mark: {Y_pred:.2f}")
-    if Y_true is not None:
-        Y_true = denormalize(Y_true)
-        print(f"Actual Exam Mark   : {Y_true:.2f}")
-        print(f"Loss (MSE)         : {((Y_pred - Y_true) ** 2):.4f}")
+    print(f"Input Assessments (unnormalized): {input_data_unnormalized.tolist()}")
+    print(f"Predicted Exam Mark: {predicted_text}")
+    print(f"Inference Time: {inference_time*1000:.3f} ms")
 
-# ---------- 9. Plot ----------
+    if Y_true is not None:
+        Y_true_denorm = denormalize(Y_true)
+        print(f"Actual Exam Mark   : {Y_true_denorm:.2f}")
+        print(f"Loss (MSE)         : {((Y_pred - Y_true_denorm) ** 2):.4f}")
+        # Check accuracy for this single prediction
+        is_accurate = '✅' if abs(Y_pred - Y_true_denorm) <= 5.0 else '❌'
+        print(f"Accuracy (±5 marks): {is_accurate}")
+
+# (9. Plot is unchanged)
 def plot_losses(train_losses, val_losses):
     plt.figure(figsize=(10,6))
     plt.plot(train_losses, label='Train Loss')
@@ -175,41 +240,43 @@ def plot_losses(train_losses, val_losses):
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig("loss_plot.png")
+    plt.savefig("loss_plot_lstm.png")
     plt.show()
 
-# ---------- 10. Load Normalization Stat ----------
-def load_normalization_stats(path='data/normalization.json'):
-    with open(path, 'r') as f:
-        stats = json.load(f)
-    mean = np.array(stats['mean'], dtype=np.float32)
-    std = np.array(stats['std'], dtype=np.float32)
-    return mean, std
-
-# ---------- 11. Main ----------
+# ---------- 11. Main (Revised Logic) ----------
 def main():
     file_path = 'data/student_marks_500.csv'
-    model_path = 'exam_model.pth'
+    model_path = 'lstm_mark_predictor_final.pth' # Updated model path
 
-    # Initialize the model
-    model = ExamPredictor(input_size=6)
-    """
-    df = pd.read_csv(file_path)
-    dataset = ExamDataset(df)
+    model = MarkPredictorLSTM()
+
+    try:
+        df = pd.read_csv(file_path)
+    except FileNotFoundError:
+        print(f"🛑 Error: Data file not found at {file_path}. Please ensure it exists.")
+        return
+
+    # Use the simplified dataset for predicting the exam mark
+    dataset = MarkSequenceDataset(df) 
     
     total_size = len(dataset)
     train_size = int(0.7 * total_size)
     test_size = int(0.2 * total_size)
     val_size = total_size - train_size - test_size
 
+    if min(train_size, test_size, val_size) <= 0:
+        print("🛑 Error: Not enough data to split into train, test, and validation sets.")
+        return
+
     train_data, test_data, val_data = random_split(dataset, [train_size, test_size, val_size])
 
-    train_loader = DataLoader(train_data, batch_size=16, shuffle=True)
-    val_loader = DataLoader(val_data, batch_size=16)
-    test_loader = DataLoader(test_data, batch_size=16)
+    train_loader = DataLoader(train_data, batch_size=4, shuffle=True)
+    val_loader = DataLoader(val_data, batch_size=4, shuffle=False)
+    test_loader = DataLoader(test_data, batch_size=4, shuffle=False)
 
     # Train
-    train_losses, val_losses = train_model(model, train_loader, val_loader, epochs=256, lr=0.001)
+    print("--- Starting Training (LSTM) ---")
+    train_losses, val_losses = train_model(model, train_loader, val_loader, epochs=128, lr=0.001)
 
     # Save and reuse
     save_model(model, model_path)
@@ -218,22 +285,65 @@ def main():
     plot_losses(train_losses, val_losses)
 
     # Evaluate
+    print("\n" + "="*50 + "\n")
+    print("--- Model Evaluation on Test Set ---")
     evaluate_model(test_loader, model)
     
-    # Visualize with random data
-    idx = random.randint(0, len(test_data) - 1)
-    X, Y = test_data[idx]
-    visualize_prediction(X, model, Y_true=Y)
-    """
-    # Visualize with hard coded data
-    input_data = torch.tensor([74,48,45,20,36,38]) / 100
+    print("\n" + "="*50 + "\n")
+    print("--- Visualization: Random Samples from Training Set ---")
 
-    # Load model
-    model = load_model(model_path)
-    model.eval()
+    # Visualize with 5 random samples from training set
+    train_data_list = list(train_data)
+    random_indices = random.sample(range(len(train_data_list)), k=5)
+    
+    for i, idx in enumerate(random_indices):
+        X_train, Y_train, _ = train_data_list[idx]
+        X_unnormalized_sequence = X_train.squeeze(-1) * 100 
+        
+        print(f"\n--- Random Sample {i+1} ---")
+        visualize_prediction(X_unnormalized_sequence, model, Y_true=Y_train)
+    
+    print("\n" + "="*50 + "\n")
+    print("--- Visualization: Hardcoded Samples with Different Trends ---")
 
-    # Predict and visualize
-    visualize_prediction(input_data.squeeze(0), model)
+    # Hard coded data (unnormalized, length must be 6)
+    hardcoded_samples = [
+        {
+            "assessments": torch.tensor([85, 90, 88, 92, 89, 91], dtype=torch.float32), 
+            "comment": "High and Consistent Marks (Strong PASS expected)"
+        },
+        {
+            "assessments": torch.tensor([30, 45, 60, 75, 50, 65], dtype=torch.float32), 
+            "comment": "Improving but Inconsistent Marks (Medium PASS expected)"
+        },
+        {
+            "assessments": torch.tensor([95, 80, 65, 50, 35, 20], dtype=torch.float32), 
+            "comment": "Steadily Declining Marks (Weak PASS/FAIL risk expected)"
+        },
+        # --- NEW EXAMPLES ---
+        {
+            "assessments": torch.tensor([20, 15, 25, 10, 30, 18], dtype=torch.float32),
+            "comment": "Consistently Very Low Marks (Guaranteed FAIL expected)"
+        },
+        {
+            "assessments": torch.tensor([30, 35, 40, 60, 75, 80], dtype=torch.float32),
+            "comment": "Late Bloomer: Steadily and Dramatically Improving (High PASS expected)"
+        },
+        {
+            "assessments": torch.tensor([85, 90, 80, 40, 30, 25], dtype=torch.float32),
+            "comment": "Started Strong, Burned Out/Gave Up (FAIL risk expected)"
+        },
+        {
+            "assessments": torch.tensor([50, 95, 30, 80, 45, 70], dtype=torch.float32),
+            "comment": "Highly Volatile Marks (Unpredictable/Medium-High PASS expected)"
+        }
+    ]
+
+    for i, sample in enumerate(hardcoded_samples):
+        input_seq = sample["assessments"]
+        print(f"\n--- Hardcoded Sample {i+1} ---")
+        print(f"Trend: {sample['comment']}")
+        visualize_prediction(input_seq, model, Y_true=None)
 
 if __name__ == '__main__':
     main()
