@@ -117,7 +117,7 @@ class MarkSequenceDataset(Dataset):
 
 # ---------- 2. Model (Unchanged) ----------
 class MarkPredictorLSTM(nn.Module):
-    def __init__(self, input_size=1, hidden_size=128, num_layers=2, output_size=1):
+    def __init__(self, input_size=1, hidden_size=32, num_layers=2, output_size=1):
         super(MarkPredictorLSTM, self).__init__()
         
         self.hidden_size = hidden_size
@@ -318,6 +318,9 @@ def main():
     model_path = 'lstm_mark_predictor_final.pth' # Updated model path
 
     model = MarkPredictorLSTM()
+
+    if os.path.exists(model_path):
+        model = load_model(model_path)
 
     try:
         df = pd.read_csv(file_path)
