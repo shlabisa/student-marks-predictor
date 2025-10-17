@@ -24,20 +24,89 @@ ASSESSMENT_MARKS = SEQUENCE_MARKS[:-1] # test1...project (length 6)
 EXAM_MARK = SEQUENCE_MARKS[-1]         # exam
 MAX_SEQ_LEN = len(ASSESSMENT_MARKS)    # 6
 
-# ---------- 1. Load and Normalize Dataset (Revised for Single Target) ----------
+# ---------- 1. Load and Normalize Dataset (Revised for Single Target with Augmentation) ----------
 class MarkSequenceDataset(Dataset):
+    
+    augment = True # Class attribute set to True by default
+
     def __init__(self, dataframe):
-        # Input sequence: Assessments (6 marks)
-        X = dataframe[ASSESSMENT_MARKS].values.astype(np.float32)
-        # Target: Exam mark (1 mark)
-        y = dataframe[EXAM_MARK].values.astype(np.float32).reshape(-1, 1)
+        
+        # 1. Extract and Normalize Original Data
+        X_orig = dataframe[ASSESSMENT_MARKS].values.astype(np.float32)
+        y_orig = dataframe[EXAM_MARK].values.astype(np.float32).reshape(-1, 1)
 
         # Normalize all marks by 100
-        self.X = torch.tensor(X / 100.0, dtype=torch.float32).unsqueeze(-1) # Shape (N, 6, 1)
-        self.y = torch.tensor(y / 100.0, dtype=torch.float32)               # Shape (N, 1)
+        X_norm_orig = X_orig / 100.0
+        y_norm_orig = y_orig / 100.0
         
-        # All sequence lengths are fixed at 6
-        self.L = torch.full((len(self.X),), MAX_SEQ_LEN, dtype=torch.long) # Shape (N,)
+        all_X = list(X_norm_orig)
+        all_y = list(y_norm_orig)
+
+        # 2. Data Augmentation
+        if self.augment:
+            print(f"📊 Generating augmented data (1 to 4 samples per original)...")
+            num_original_samples = len(X_norm_orig)
+            
+            for i in range(num_original_samples):
+                original_input = X_norm_orig[i]
+                original_target = y_norm_orig[i]
+                
+                # Randomly decide to add 1 to 4 augmented data points
+                num_augmentations = random.randint(1, 4)
+                
+                for _ in range(num_augmentations):
+                    X_aug = self._augment(original_input.copy())
+                    all_X.append(X_aug)
+                    all_y.append(original_target) # Target remains the same
+        
+        # 3. Convert to Tensors
+        self.X = torch.tensor(np.array(all_X), dtype=torch.float32).unsqueeze(-1) # Shape (N_total, 6, 1)
+        self.y = torch.tensor(np.array(all_y), dtype=torch.float32)               # Shape (N_total, 1)
+        
+        # All sequence lengths are fixed at 6 (since we are only predicting the exam mark)
+        self.L = torch.full((len(self.X),), MAX_SEQ_LEN, dtype=torch.long) # Shape (N_total,)
+        
+        print(f"Dataset Size: {len(X_norm_orig)} original samples. Total Size (incl. aug): {len(self.X)} samples.")
+
+
+    def _augment(self, sequence):
+        """
+        Applies a random combination of augmentation techniques to the input sequence (normalized).
+        
+        Args:
+            sequence (np.array): A 1D numpy array of the 6 assessment marks (normalized [0, 1]).
+            
+        Returns:
+            np.array: The augmented 1D numpy array.
+        """
+        
+        # Augmentation 1: Add small Gaussian noise (simulates measurement error/slight mark variation)
+        if random.random() < 0.7: # 70% chance
+            noise = np.random.normal(loc=0.0, scale=0.01, size=sequence.shape) # Scale is small (e.g., +/- 1 mark out of 100)
+            sequence = sequence + noise
+            
+        # Augmentation 2: Time-Series Shift/Subsetting (simulates missing or swapped marks)
+        if random.random() < 0.4: # 40% chance
+            # Shift marks by one position and zero-fill the first/last mark
+            if random.random() < 0.5:
+                 # Shift right (losing the last mark, repeating the first/zeroing the first)
+                 sequence = np.roll(sequence, 1)
+                 sequence[0] = 0.0 # Fill start with 0
+            else:
+                 # Shift left (losing the first mark, zeroing the last)
+                 sequence = np.roll(sequence, -1)
+                 sequence[-1] = 0.0 # Fill end with 0
+
+        # Augmentation 3: Multiply by a small random factor (simulates slight leniency/strictness)
+        if random.random() < 0.5: # 50% chance
+            # Factor between 0.95 and 1.05
+            factor = np.random.uniform(0.95, 1.05)
+            sequence = sequence * factor
+
+        # Clamp values to the valid normalized range [0, 1]
+        sequence = np.clip(sequence, 0.0, 1.0)
+        
+        return sequence
 
     def __len__(self):
         return len(self.X)
@@ -48,7 +117,7 @@ class MarkSequenceDataset(Dataset):
 
 # ---------- 2. Model (Unchanged) ----------
 class MarkPredictorLSTM(nn.Module):
-    def __init__(self, input_size=1, hidden_size=64, num_layers=2, output_size=1):
+    def __init__(self, input_size=1, hidden_size=128, num_layers=2, output_size=1):
         super(MarkPredictorLSTM, self).__init__()
         
         self.hidden_size = hidden_size
@@ -276,7 +345,7 @@ def main():
 
     # Train
     print("--- Starting Training (LSTM) ---")
-    train_losses, val_losses = train_model(model, train_loader, val_loader, epochs=128, lr=0.001)
+    train_losses, val_losses = train_model(model, train_loader, val_loader, epochs=256, lr=0.001)
 
     # Save and reuse
     save_model(model, model_path)
