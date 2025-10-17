@@ -22,101 +22,141 @@ np.random.seed(42)
 SEQUENCE_MARKS = ['test1', 'test2', 'test3', 'assignment1', 'assignment2', 'project', 'exam']
 ASSESSMENT_MARKS = SEQUENCE_MARKS[:-1] # test1...project (length 6)
 EXAM_MARK = SEQUENCE_MARKS[-1]         # exam
-MAX_SEQ_LEN = len(ASSESSMENT_MARKS)    # 6
 
-# ---------- 1. Load and Normalize Dataset (Revised for Single Target with Augmentation) ----------
+# *** REVISED MAX_SEQ_LEN ***
+MAX_SEQ_LEN = 8 # Set max sequence length to 8
+
+# A helper function for padding, reusable by Dataset and Predict functions
+def _pad_and_structure_input(sequence_unnormalized, max_len):
+    """
+    Normalizes, pads, and structures a variable-length sequence for the LSTM.
+    
+    Args:
+        sequence_unnormalized (torch.Tensor or np.array): The mark sequence (unnormalized).
+        max_len (int): The target padded length.
+        
+    Returns:
+        tuple: (X_padded, L_actual) where X_padded is (1, max_len, 1) and L_actual is (1,).
+    """
+    
+    # 1. Normalize
+    normalized_seq = sequence_unnormalized / 100.0
+    seq_len = len(normalized_seq)
+    
+    if seq_len > max_len:
+        raise ValueError(f"Input sequence length ({seq_len}) exceeds MAX_SEQ_LEN ({max_len}).")
+
+    # 2. Pad to max_len. Padding at the start (pre-padding) for sequence data is common.
+    # Pad at the *end* (post-padding) here since we are predicting the final exam mark, 
+    # and the last non-padded mark is the most important context.
+    padding_needed = max_len - seq_len
+    
+    # Pad at the end (post-padding)
+    padded_sequence = np.pad(normalized_seq.numpy(), (0, padding_needed), 
+                             'constant', constant_values=(0.0, 0.0))
+    
+    # 3. Structure for LSTM: (1, max_len, 1)
+    X = torch.tensor(padded_sequence, dtype=torch.float32).unsqueeze(0).unsqueeze(-1)
+    
+    # 4. Sequence length tensor: (1,)
+    L = torch.tensor([seq_len], dtype=torch.long)
+    
+    return X, L
+
+# ---------- 1. Load and Normalize Dataset (Revised for Dynamic Input Size) ----------
 class MarkSequenceDataset(Dataset):
     
-    augment = True # Class attribute set to True by default
+    augment = True
 
     def __init__(self, dataframe):
         
-        # 1. Extract and Normalize Original Data
-        X_orig = dataframe[ASSESSMENT_MARKS].values.astype(np.float32)
+        # 1. Extract Original Data (Assessments length 6)
+        X_orig_unnorm = dataframe[ASSESSMENT_MARKS].values.astype(np.float32)
         y_orig = dataframe[EXAM_MARK].values.astype(np.float32).reshape(-1, 1)
-
-        # Normalize all marks by 100
-        X_norm_orig = X_orig / 100.0
         y_norm_orig = y_orig / 100.0
         
-        all_X = list(X_norm_orig)
+        all_X_unnorm = list(X_orig_unnorm)
         all_y = list(y_norm_orig)
 
-        # 2. Data Augmentation
+        # 2. Data Augmentation (Augmented data remains length 6)
         if self.augment:
-            print(f"📊 Generating augmented data (1 to 4 samples per original)...")
-            num_original_samples = len(X_norm_orig)
+            print(f"📊 Generating augmented data (0 to 2 samples per original)...")
+            num_original_samples = len(X_orig_unnorm)
             
             for i in range(num_original_samples):
-                original_input = X_norm_orig[i]
+                original_input = X_orig_unnorm[i]
                 original_target = y_norm_orig[i]
                 
-                # Randomly decide to add 1 to 4 augmented data points
-                num_augmentations = random.randint(1, 4)
+                num_augmentations = random.randint(0, 2)
                 
                 for _ in range(num_augmentations):
-                    X_aug = self._augment(original_input.copy())
-                    all_X.append(X_aug)
-                    all_y.append(original_target) # Target remains the same
+                    # Augment unnormalized data
+                    X_aug_unnorm = self._augment(original_input.copy()) 
+                    all_X_unnorm.append(X_aug_unnorm)
+                    all_y.append(original_target) 
+
+        # 3. Process All Data for LSTM
+        # We process each sample to pad it to MAX_SEQ_LEN (8)
+        self.X_padded = []
+        self.L_actual = []
         
-        # 3. Convert to Tensors
-        self.X = torch.tensor(np.array(all_X), dtype=torch.float32).unsqueeze(-1) # Shape (N_total, 6, 1)
-        self.y = torch.tensor(np.array(all_y), dtype=torch.float32)               # Shape (N_total, 1)
+        for X_unnorm in all_X_unnorm:
+            X_tensor = torch.tensor(X_unnorm, dtype=torch.float32)
+            # Use the new padding function. We ignore the (1,) batch dim here.
+            X_padded_batch, L_batch = _pad_and_structure_input(X_tensor, MAX_SEQ_LEN)
+            self.X_padded.append(X_padded_batch.squeeze(0)) # Shape (8, 1)
+            self.L_actual.append(L_batch.squeeze(0))        # Shape (1,)
+
+        self.X = torch.stack(self.X_padded, dim=0) # Shape (N_total, 8, 1)
+        self.L = torch.stack(self.L_actual, dim=0) # Shape (N_total,)
+        self.y = torch.tensor(np.array(all_y), dtype=torch.float32) # Shape (N_total, 1)
         
-        # All sequence lengths are fixed at 6 (since we are only predicting the exam mark)
-        self.L = torch.full((len(self.X),), MAX_SEQ_LEN, dtype=torch.long) # Shape (N_total,)
-        
-        print(f"Dataset Size: {len(X_norm_orig)} original samples. Total Size (incl. aug): {len(self.X)} samples.")
+        print(f"Dataset Size: {len(X_orig_unnorm)} original samples. Total Size (incl. aug): {len(self.X)} samples.")
+        print(f"Input tensor size is now: (N, {MAX_SEQ_LEN}, 1)")
 
 
     def _augment(self, sequence):
         """
-        Applies a random combination of augmentation techniques to the input sequence (normalized).
-        
-        Args:
-            sequence (np.array): A 1D numpy array of the 6 assessment marks (normalized [0, 1]).
-            
-        Returns:
-            np.array: The augmented 1D numpy array.
+        Applies augmentation to the unnormalized input sequence.
         """
+        # Normalization is contained within augmentation logic for better control over noise scale
+        sequence_norm = sequence / 100.0 
         
-        # Augmentation 1: Add small Gaussian noise (simulates measurement error/slight mark variation)
-        if random.random() < 0.7: # 70% chance
-            noise = np.random.normal(loc=0.0, scale=0.01, size=sequence.shape) # Scale is small (e.g., +/- 1 mark out of 100)
-            sequence = sequence + noise
+        # Augmentation 1: Add small Gaussian noise 
+        if random.random() < 0.7: 
+            noise = np.random.normal(loc=0.0, scale=0.01, size=sequence_norm.shape) 
+            sequence_norm = sequence_norm + noise
             
-        # Augmentation 2: Time-Series Shift/Subsetting (simulates missing or swapped marks)
-        if random.random() < 0.4: # 40% chance
-            # Shift marks by one position and zero-fill the first/last mark
+        # Augmentation 2: Time-Series Shift/Subsetting 
+        if random.random() < 0.4:
             if random.random() < 0.5:
-                 # Shift right (losing the last mark, repeating the first/zeroing the first)
-                 sequence = np.roll(sequence, 1)
-                 sequence[0] = 0.0 # Fill start with 0
+                 sequence_norm = np.roll(sequence_norm, 1)
+                 sequence_norm[0] = 0.0
             else:
-                 # Shift left (losing the first mark, zeroing the last)
-                 sequence = np.roll(sequence, -1)
-                 sequence[-1] = 0.0 # Fill end with 0
+                 sequence_norm = np.roll(sequence_norm, -1)
+                 sequence_norm[-1] = 0.0
 
-        # Augmentation 3: Multiply by a small random factor (simulates slight leniency/strictness)
-        if random.random() < 0.5: # 50% chance
-            # Factor between 0.95 and 1.05
+        # Augmentation 3: Multiply by a small random factor 
+        if random.random() < 0.5: 
             factor = np.random.uniform(0.95, 1.05)
-            sequence = sequence * factor
+            sequence_norm = sequence_norm * factor
 
         # Clamp values to the valid normalized range [0, 1]
-        sequence = np.clip(sequence, 0.0, 1.0)
+        sequence_norm = np.clip(sequence_norm, 0.0, 1.0)
         
-        return sequence
+        # Return unnormalized sequence
+        return sequence_norm * 100.0
 
     def __len__(self):
         return len(self.X)
 
     def __getitem__(self, idx):
-        # Return X: (6, 1), y: (1,), L: scalar (6)
+        # Return X: (8, 1), y: (1,), L: scalar (6)
         return self.X[idx], self.y[idx], self.L[idx]
 
-# ---------- 2. Model (Unchanged) ----------
+# ---------- 2. Model (Updated input dimension) ----------
 class MarkPredictorLSTM(nn.Module):
+    # (Unchanged since it handles MAX_SEQ_LEN through pack_padded_sequence)
     def __init__(self, input_size=1, hidden_size=32, num_layers=2, output_size=1):
         super(MarkPredictorLSTM, self).__init__()
         
@@ -134,7 +174,7 @@ class MarkPredictorLSTM(nn.Module):
         
         lstm_out_packed, (h_n, c_n) = self.lstm(x_packed)
         
-        last_hidden_state = h_n[-1] # Output of the last layer
+        last_hidden_state = h_n[-1]
         
         output = self.fc(last_hidden_state)
         output = self.sigmoid(output)
@@ -195,25 +235,18 @@ def load_model(path='lstm_mark_predictor_final.pth'):
 def denormalize(pred_tensor):
     return pred_tensor.item() * 100
 
-# ---------- 6. Predict (Updated for Fixed Sequence Input) ----------
+# ---------- 6. Predict (Updated for Dynamic Sequence Input) ----------
 def predict(input_sequence, model):
     """
-    Predicts the next mark for a given sequence of 6 unnormalized marks.
-    Input_sequence is a 1D tensor of *unnormalized* marks of length 6.
+    Predicts the next mark for a given sequence of 1 to MAX_SEQ_LEN unnormalized marks.
     """
     
-    if len(input_sequence) != MAX_SEQ_LEN:
-        raise ValueError(f"Input sequence must have exactly {MAX_SEQ_LEN} elements (assessments).")
+    seq_len = len(input_sequence)
+    if seq_len < 1 or seq_len > MAX_SEQ_LEN:
+        raise ValueError(f"Input sequence length ({seq_len}) must be between 1 and {MAX_SEQ_LEN}.")
         
-    # 1. Normalize and structure the input
-    normalized_seq = input_sequence / 100.0
-    seq_len = MAX_SEQ_LEN
-    
-    # 2. Convert to tensor with required shape: (1, MAX_SEQ_LEN, 1)
-    X = normalized_seq.unsqueeze(0).unsqueeze(-1)
-    
-    # 3. Sequence length tensor: (1,)
-    L = torch.tensor([seq_len], dtype=torch.long)
+    # Use the helper function to pad and structure the input
+    X, L = _pad_and_structure_input(input_sequence, MAX_SEQ_LEN)
     
     # 4. Prediction and time measurement for FPS
     start_time = time.time()
@@ -224,11 +257,8 @@ def predict(input_sequence, model):
     # 5. Denormalize and return with inference time
     return denormalize(output), (end_time - start_time)
 
-# ---------- 7. Evaluate (Revised for Accuracy and FPS) ----------
+# ---------- 7. Evaluate (Unchanged) ----------
 def calculate_accuracy(preds_denorm, y_true_denorm, tolerance=5.0):
-    """
-    Calculates accuracy: percentage of predictions within a tolerance range of the true mark.
-    """
     correct = torch.sum(torch.abs(preds_denorm - y_true_denorm) <= tolerance).item()
     total = len(y_true_denorm)
     accuracy = correct / total
@@ -273,7 +303,7 @@ def evaluate_model(test_loader, model):
     print(f"🎯 Test Set Accuracy (±5 marks): {accuracy:.2f}")
     print(f"⚡ Inference Performance (FPS): {fps:.2f}")
 
-# ---------- 8. Visualize Prediction (Enhanced with Highlight) ----------
+# ---------- 8. Visualize Prediction (Unchanged) ----------
 def visualize_prediction(input_data_unnormalized, model, Y_true=None):
     
     try:
@@ -282,11 +312,10 @@ def visualize_prediction(input_data_unnormalized, model, Y_true=None):
         print(f"\n🛑 Error for Visualization: {e}")
         return
 
-    # Use ANSI code for green highlighting
     predicted_text = f"{GREEN}{Y_pred:.2f}{ENDC}"
 
     print("\n🔍 Test Sample Evaluation:")
-    print(f"Input Assessments (unnormalized): {input_data_unnormalized.tolist()}")
+    print(f"Input Assessments (unnormalized) [Len: {len(input_data_unnormalized)}]: {input_data_unnormalized.tolist()}")
     print(f"Predicted Exam Mark: {predicted_text}")
     print(f"Inference Time: {inference_time*1000:.3f} ms")
 
@@ -294,7 +323,6 @@ def visualize_prediction(input_data_unnormalized, model, Y_true=None):
         Y_true_denorm = denormalize(Y_true)
         print(f"Actual Exam Mark   : {Y_true_denorm:.2f}")
         print(f"Loss (MSE)         : {((Y_pred - Y_true_denorm) ** 2):.4f}")
-        # Check accuracy for this single prediction
         is_accurate = '✅' if abs(Y_pred - Y_true_denorm) <= 5.0 else '❌'
         print(f"Accuracy (±5 marks): {is_accurate}")
 
@@ -312,10 +340,10 @@ def plot_losses(train_losses, val_losses):
     plt.savefig("loss_plot_lstm.png")
     plt.show()
 
-# ---------- 11. Main (Revised Logic) ----------
+# ---------- 11. Main (Revised Logic for Dynamic Input) ----------
 def main():
     file_path = 'data/student_marks_500.csv'
-    model_path = 'lstm_mark_predictor_final.pth' # Updated model path
+    model_path = 'lstm_mark_predictor_final.pth'
 
     model = MarkPredictorLSTM()
 
@@ -328,7 +356,6 @@ def main():
         print(f"🛑 Error: Data file not found at {file_path}. Please ensure it exists.")
         return
 
-    # Use the simplified dataset for predicting the exam mark
     dataset = MarkSequenceDataset(df) 
     
     total_size = len(dataset)
@@ -348,7 +375,7 @@ def main():
 
     # Train
     print("--- Starting Training (LSTM) ---")
-    train_losses, val_losses = train_model(model, train_loader, val_loader, epochs=256, lr=0.001)
+    train_losses, val_losses = train_model(model, train_loader, val_loader, epochs=128, lr=0.001) # Reduced epochs for faster output
 
     # Save and reuse
     save_model(model, model_path)
@@ -362,59 +389,33 @@ def main():
     evaluate_model(test_loader, model)
     
     print("\n" + "="*50 + "\n")
-    print("--- Visualization: Random Samples from Training Set ---")
+    print("--- Visualization: Dynamic Hardcoded Samples (Len 2 to 8) ---")
 
-    # Visualize with 5 random samples from training set
-    train_data_list = list(train_data)
-    random_indices = random.sample(range(len(train_data_list)), k=5)
-    
-    for i, idx in enumerate(random_indices):
-        X_train, Y_train, _ = train_data_list[idx]
-        X_unnormalized_sequence = X_train.squeeze(-1) * 100 
-        
-        print(f"\n--- Random Sample {i+1} ---")
-        visualize_prediction(X_unnormalized_sequence, model, Y_true=Y_train)
-    
-    print("\n" + "="*50 + "\n")
-    print("--- Visualization: Hardcoded Samples with Different Trends ---")
-
-    # Hard coded data (unnormalized, length must be 6)
-    hardcoded_samples = [
+    # Hard coded data with DYNAMIC lengths (max length is 8, but actual input is variable)
+    hardcoded_dynamic_samples = [
         {
-            "assessments": torch.tensor([85, 90, 88, 92, 89, 91], dtype=torch.float32), 
-            "comment": "High and Consistent Marks (Strong PASS expected)"
+            "assessments": torch.tensor([85, 90], dtype=torch.float32), 
+            "comment": "Length 2: Strong Start (Early prediction)"
         },
         {
-            "assessments": torch.tensor([30, 45, 60, 75, 50, 65], dtype=torch.float32), 
-            "comment": "Improving but Inconsistent Marks (Medium PASS expected)"
+            "assessments": torch.tensor([30, 45, 60, 75], dtype=torch.float32), 
+            "comment": "Length 4: Improving trend (Mid-point prediction)"
         },
         {
             "assessments": torch.tensor([95, 80, 65, 50, 35, 20], dtype=torch.float32), 
-            "comment": "Steadily Declining Marks (Weak PASS/FAIL risk expected)"
-        },
-        # --- NEW EXAMPLES ---
-        {
-            "assessments": torch.tensor([20, 15, 25, 10, 30, 18], dtype=torch.float32),
-            "comment": "Consistently Very Low Marks (Guaranteed FAIL expected)"
+            "comment": "Length 6: Declining trend (Full assessment prediction)"
         },
         {
-            "assessments": torch.tensor([30, 35, 40, 60, 75, 80], dtype=torch.float32),
-            "comment": "Late Bloomer: Steadily and Dramatically Improving (High PASS expected)"
-        },
-        {
-            "assessments": torch.tensor([85, 90, 80, 40, 30, 25], dtype=torch.float32),
-            "comment": "Started Strong, Burned Out/Gave Up (FAIL risk expected)"
-        },
-        {
-            "assessments": torch.tensor([50, 95, 30, 80, 45, 70], dtype=torch.float32),
-            "comment": "Highly Volatile Marks (Unpredictable/Medium-High PASS expected)"
+            "assessments": torch.tensor([10, 20, 30, 40, 50, 60, 70, 80], dtype=torch.float32),
+            "comment": f"Length 8: Hypothetical Full Max-Length Sequence (Maximum Context)"
         }
     ]
 
-    for i, sample in enumerate(hardcoded_samples):
+    for i, sample in enumerate(hardcoded_dynamic_samples):
         input_seq = sample["assessments"]
         print(f"\n--- Hardcoded Sample {i+1} ---")
         print(f"Trend: {sample['comment']}")
+        # The prediction function now handles the variable length
         visualize_prediction(input_seq, model, Y_true=None)
 
 if __name__ == '__main__':
